@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # GraphRouterV2
 
 A graph neural network (GNN) that routes each incoming query to the best of several candidate LLMs, trading off correctness, cost, latency, and reliability. Queries and models are nodes in a bipartite graph; query→model edges carry execution features (cost, latency, correctness, tokens, completion status), and the network learns to score each edge so the highest-scoring model can be picked at inference time.
