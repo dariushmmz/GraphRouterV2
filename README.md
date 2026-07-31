@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # GraphRouterV2
 
 A graph neural network (GNN) that routes each incoming query to the best of several candidate LLMs, trading off correctness, cost, latency, and reliability. Queries and models are nodes in a bipartite graph; query→model edges carry execution features (cost, latency, correctness, tokens, completion status), and the network learns to score each edge so the highest-scoring model can be picked at inference time.
@@ -96,3 +97,6 @@ reported against two baselines — Single-Best-Model (accuracy-first) and Cost-O
 Evaluation runs on **pooled out-of-fold predictions** across all k folds rather than averaging per-fold scores, for a lower-variance estimate on a small dataset.
 
 See the [technical report](./GraphRouterV2_Technical_Report.md) for the current model's results and open issues.
+=======
+# GraphRouterV2
+>>>>>>> 16fc3fc4c7c477cd809bf33494ae4ca5817104a6
