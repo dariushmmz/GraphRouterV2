@@ -1,0 +1,99 @@
+# Config parameters for router data construction:
+
+data_dir: 'datasets/200Q-Final/'
+query_response_length: 512
+
+
+# Config parameters for graph_router training:
+seed: 1881
+wandb_key: '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'
+model_path: 'checkpoints/final/'
+feedback: False
+semantic: False
+
+train_epoch: 100
+kfold_cv: True
+kfold_k: 5
+kfold_make_plots: True
+kfold_inner_val_ratio: 0.1
+
+#scenario: "Cost First"  # "Performance First", "Balance", and "Cost First"
+llm_num: 7
+learning_rate: 0.0003
+weight_decay: 0.03
+train_mask_rate: 0.3
+batch_size: 32
+num_task: 1
+split_ratio: [0.7, 0.1, 0.2]
+embedding_dim: 8
+
+dropout: 0.35            # was implicitly 0 everywhere in EncoderDecoderNet. Sweep 0.1-0.5 if you tune.
+early_stopping_patience: 20   # stops once val_loss hasn't improved for N epochs. Set to null to disable (old fixed-epoch behavior).
+
+benchmark_path: "datasets/200Q-Final/Router_Benchmark_reduced.csv"
+
+# difficulty and reasoning_depth in the real benchmark mix numeric strings
+# ('7','8','9' / '3','4','5') with text labels ('Medium','Very High',...) on
+# an unspecified combined scale. Left unset (null) below -> both are one-hot
+# encoded, each distinct string its own category. Only set these if you
+# determine the real combined ordering (e.g. per-`source` scale mapping):
+# difficulty_ordinal_order: null
+# reasoning_depth_ordinal_order: null
+
+# Phase 6 utility weights (placeholders -- not tuned against the paper's
+# protocol; sweep against the validation split before trusting the ranking).
+# Note `scenario: "Cost First"` in your existing config is now UNUSED by the
+# training/label path (it drove the old effect = a*cost - b*effect scenario
+# logic, replaced by this utility function). It's still read by
+# infer_single_query()'s make_plot() call purely as a plot title/scenario
+# label -- harmless to leave, but it no longer affects which LLM is
+# predicted best.
+
+#exclude_llms:
+#  - router_id: "deepseek/deepseek-r1"
+#    display_name: "DeepSeek-R1"
+
+# Named utility-weight profiles, replacing the old single flat set. Pick the
+# active one with `utility_scenario` below -- this makes deployment intent
+# explicit in config instead of implicit in whatever numbers happen to be
+# checked in. router_evaluation.py reports Utility Gap Closed against BOTH
+# the Single-Best-Model baseline (accuracy-first framing) and the
+# Cost-Optimal baseline (cost/latency-first framing); which one is the
+# "right" comparison to judge success against depends on which scenario is
+# active here.
+#
+# w_completion_reliability is now auto-verified at load time
+# (auto_drop_zero_variance_utility_weights in multi_task_graph_router.py):
+# if Completion_Status has no variance in the current data, this weight is
+# zeroed automatically for the run (with a printed warning) rather than
+# silently contributing a no-op constant offset. No manual action needed
+# here -- it re-activates on its own once real completion failures appear.
+utility_scenario: "cost_first"
+
+utility_weight_profiles:
+  performance_first:
+    w_success: 1.0
+    w_cost: 0.2
+    w_latency: 0.2
+    w_output_tokens: 0.1
+    w_completion_reliability: 0.1
+
+  balance:
+    w_success: 1.0
+    w_cost: 0.4
+    w_latency: 0.4
+    w_output_tokens: 0.2
+    w_completion_reliability: 0.1
+
+  # Current active profile (see utility_scenario above). Correctness is
+  # still weighted (w_success=1.0), but cost/latency/output-token penalties
+  # are large enough relative to it that the router's effective behavior is
+  # cost/latency-optimized in practice -- see the evaluation report's
+  # "Cost Reduction vs SBM" / "Latency Reduction vs SBM" figures. Judge this
+  # profile's results primarily against the Cost-Optimal baseline, not SBM.
+  cost_first:
+    w_success: 1.0
+    w_cost: 0.6
+    w_latency: 0.4
+    w_output_tokens: 0.3
+    w_completion_reliability: 0.1
