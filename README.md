@@ -96,6 +96,3 @@ reported against two baselines — Single-Best-Model (accuracy-first) and Cost-O
 Evaluation runs on **pooled out-of-fold predictions** across all k folds rather than averaging per-fold scores, for a lower-variance estimate on a small dataset.
 
 See the [technical report](./GraphRouterV2_Technical_Report.md) for the current model's results and open issues.
-=======
-# GraphRouterV2
->>>>>>> 16fc3fc4c7c477cd809bf33494ae4ca5817104a6

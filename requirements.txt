@@ -1,0 +1,19 @@
+# Core numerical / data
+numpy
+pandas
+scikit-learn
+
+# Deep learning
+torch
+torch_geometric
+
+# Plotting (training dashboards, loss/metric curves)
+matplotlib
+
+# Config / env
+PyYAML
+python-dotenv
+
+# Experiment tracking (imported in run_exp.py / inference.py; safe to omit
+# if you don't use Weights & Biases -- the code guards wandb=None)
+wandb
