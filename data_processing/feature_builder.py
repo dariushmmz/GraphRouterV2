@@ -196,17 +196,46 @@ class FeatureEncoders:
 
     @property
     def node_metadata_dim(self) -> int:
+        # NOTE: domain macro-category is NOT included here -- it moved off
+        # the Question node onto the shared Reasoning prototype nodes (see
+        # reasoning_node_dim / build_reasoning_node_features /
+        # assign_reasoning_node_index below). Everything else
+        # (reasoning_type, difficulty, reasoning_depth, answer_type,
+        # solution_steps, question_length) stays on the Question node.
         diff_dim = 1 if (self.difficulty_ordinal_order or self.difficulty_is_numeric) else len(self.difficulty_categories)
         rdepth_dim = 1 if (self.reasoning_depth_ordinal_order or self.reasoning_depth_is_numeric) else len(self.reasoning_depth_categories)
         return (
-            (len(self.domain_precomputed_columns) if self.domain_precomputed_columns else len(self.domain_categories))
-            + len(self.reasoning_type_categories)
+            len(self.reasoning_type_categories)
             + diff_dim
             + rdepth_dim
             + 1  # solution_steps
             + len(self.answer_type_categories)
             + 1  # question_length
         )
+
+    @property
+    def reasoning_categories(self) -> list:
+        """
+        Ordered list of the domain macro-category names in use, one per
+        shared Reasoning prototype node. Mirrors the domain
+        precomputed-columns-vs-bucketed-text fallback used in
+        build_node_metadata previously: prefers the fixed
+        DOMAIN_MACRO_CATEGORIES order (derived from whichever source was
+        fit), so the Reasoning node count/order is stable across
+        train/val/test splits and across fit_encoders() calls.
+        """
+        if self.domain_precomputed_columns:
+            return [c[len("domain_"):] for c in self.domain_precomputed_columns]
+        return list(self.domain_categories)
+
+    @property
+    def reasoning_node_dim(self) -> int:
+        """
+        Feature width of each Reasoning prototype node = number of domain
+        macro-categories. Each prototype node's own input feature is its
+        one-hot identity within this set (see build_reasoning_node_features).
+        """
+        return len(self.reasoning_categories)
 
     @property
     def edge_feature_dim(self) -> int:
@@ -419,15 +448,15 @@ def build_node_metadata(df: pd.DataFrame, enc: FeatureEncoders) -> np.ndarray:
     Phase 2/3: per-row metadata vector (row granularity = router_data row,
     caller is responsible for subsetting to unique query rows, exactly as
     prepare_data_for_GNN already does for query_embedding/task_embedding).
+
+    NOTE: domain macro-category is deliberately NOT part of this vector --
+    it's the Reasoning node's own feature now (see
+    build_reasoning_node_features / assign_reasoning_node_index), not
+    something folded into the Question node. Everything else here still
+    concatenates into the Question node's feature vector as before.
     """
     parts = []
 
-    if enc.domain_precomputed_columns:
-        domain_block = df.reindex(columns=enc.domain_precomputed_columns, fill_value=0)
-        parts.append(domain_block.fillna(0).astype(float).values.astype(np.float32))
-    else:
-        domain_macro_series = df.get("domain", pd.Series([None] * len(df))).apply(categorize_domain_macro)
-        parts.append(_onehot(domain_macro_series, enc.domain_categories))
     parts.append(_onehot(df.get("reasoning_type", pd.Series([None] * len(df))), enc.reasoning_type_categories))
 
     if enc.difficulty_ordinal_order:
@@ -463,6 +492,37 @@ def build_node_metadata(df: pd.DataFrame, enc: FeatureEncoders) -> np.ndarray:
     parts.append(_zscore_apply(np.log1p(q_len), *enc.question_length_mu_sigma).reshape(-1, 1).astype(np.float32))
 
     return np.concatenate(parts, axis=1) if parts else np.zeros((len(df), 0), dtype=np.float32)
+
+
+def build_reasoning_node_features(enc: FeatureEncoders) -> np.ndarray:
+    """
+    Feature matrix for the shared Reasoning prototype nodes: one row per
+    domain macro-category, in the same fixed order as enc.reasoning_categories.
+    Each prototype node's feature is simply its own one-hot identity within
+    that fixed set (an identity matrix) -- there is one node per category,
+    shared across every query in that bucket, not one node per query.
+    """
+    n = enc.reasoning_node_dim
+    return np.eye(n, dtype=np.float32) if n > 0 else np.zeros((0, 0), dtype=np.float32)
+
+
+def assign_reasoning_node_index(df: pd.DataFrame, enc: FeatureEncoders) -> np.ndarray:
+    """
+    Per-row index (0-based) into the Reasoning prototype node set
+    (enc.reasoning_categories) that each router_data row's query belongs to.
+    Caller subsets to unique query rows the same way it does for
+    query_embedding/task_embedding/node_metadata.
+    """
+    categories = enc.reasoning_categories
+    cat_to_idx = {c: i for i, c in enumerate(categories)}
+    other_idx = cat_to_idx.get("Other", 0)
+
+    if enc.domain_precomputed_columns:
+        domain_block = df.reindex(columns=enc.domain_precomputed_columns, fill_value=0).fillna(0)
+        return domain_block.values.argmax(axis=1).astype(np.int64)
+
+    domain_macro_series = df.get("domain", pd.Series([None] * len(df))).apply(categorize_domain_macro)
+    return domain_macro_series.map(lambda c: cat_to_idx.get(c, other_idx)).values.astype(np.int64)
 
 
 def build_edge_features(df: pd.DataFrame, enc: FeatureEncoders) -> np.ndarray:

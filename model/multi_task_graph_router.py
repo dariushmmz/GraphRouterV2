@@ -1,479 +1,59 @@
+"""
+Core orchestration class for training / inference / k-fold CV of the
+multi-task graph router.
+
+Extracted from the original monolithic multi_task_graph_router.py.
+Responsibilities that don't need direct access to this class's internal
+state have been moved out to sibling modules:
+
+  - router_utility.py   : utility scoring + ranking metrics (pure functions)
+  - router_plotting.py  : plotly chart generation (pure functions)
+  - io_utils.py          : JSON / pickle load-save helpers (pure functions)
+  - data_integrity.py    : DataIntegrityMixin (row/query-block enforcement)
+  - kfold_cv.py           : KFoldCVMixin (leakage-free K-fold CV loop)
+
+No behavior changes were made during this split -- every method body is
+unchanged from the original file, only relocated and re-imported.
+"""
+
 import os
+import random
 
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
-import random
 import numpy as np
+import pandas as pd
 import torch
-from graph_nn import form_data, EncoderDecoderNet, run_kfold_cv
+
+from model.graph_data import form_data
+from model.graph_layers import EncoderDecoderNet, resolve_checkpoint_dir
+# NOTE: run_kfold_cv is no longer imported/used here -- it split already-
+# featurized rows internally, which caused the cross-fold encoder-fitting
+# leakage described at the kfold_cv branch below. Replaced by
+# KFoldCVMixin._run_kfold_cv_no_leakage(), which fits fresh encoders per
+# fold before featurizing. run_kfold_cv() itself still exists in
+# model/gnn_kfold_legacy.py but is unused here; leave/remove it there as
+# you see fit.
 from data_processing.utils import ask_and_save_feedback, ensure_2d, parse_embedding_field
 from data_processing import feature_builder as fb
-import pandas as pd
-import json
-import pickle
-import re
-import yaml
+
+from model.data_integrity import DataIntegrityMixin
+from model.kfold_cv import KFoldCVMixin
+from model.router_utility import (
+    calculate_query_utility,
+    compute_ranking_metrics,
+    resolve_utility_weights,
+    auto_drop_zero_variance_utility_weights,
+)
+from model.router_plotting import make_plot, plot_ground_truth_ranking
+from model.io_utils import loadjson, loadpkl
+from model.explainability import explain_selection
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("---------------> ALL IMPORTED")
 
 
-def calculate_query_utility(
-    query_id: str | int,
-    df: pd.DataFrame,
-    weights: dict = None,
-    query_id_col: str = 'query_id',
-) -> pd.DataFrame:
-    """
-    Calculates utility scores across all models for a specific query ID using
-    exact dataset column names.
-
-    Parameters:
-    -----------
-    query_id : str or int
-        Unique identifier for the target query.
-    df : pd.DataFrame
-        DataFrame containing query benchmarking records across candidate models.
-    weights : dict, optional
-        Utility weights matching config.yaml specifications.
-    query_id_col : str, optional
-        Column to filter on. Defaults to 'query_id'; pass 'row_id' when
-        calling against router_data.csv-derived DataFrames in this codebase,
-        which use 'row_id' as the per-query identifier.
-
-    Returns:
-    --------
-    pd.DataFrame
-        Table of candidate models ranked by calculated utility score.
-    """
-    # Default weights matching config.yaml
-    if weights is None:
-        weights = {
-            'w_success': 1.0,
-            'w_cost': 0.3,
-            'w_latency': 0.3,
-            'w_output_tokens': 0.2,
-            'w_completion_reliability': 0.5
-        }
-
-    # Filter dataframe for the given query
-    query_df = df[df[query_id_col] == query_id].copy()
-    if query_df.empty:
-        raise ValueError(f"Query ID '{query_id}' not found in the dataset.")
-
-    # Extract key metric series using exact column names
-    success = query_df['Correct'].astype(float)
-    cost = query_df['Cost'].astype(float)
-    latency = query_df['Latency'].astype(float)
-    out_tokens = query_df['Output_Tokens'].astype(float)
-
-    # Reliability: 1.0 if status indicates success/completion, otherwise 0.0
-    reliability = query_df['Completion_Status'].apply(
-        lambda x: 1.0 if x in [1, True, 'Success', 'SUCCESS', 'Completed', 'completed'] else (float(x) if str(x).replace('.', '', 1).isdigit() else 0.0)
-    )
-
-    # Per-query min-max normalization function for penalty metrics
-    def min_max_norm(series: pd.Series) -> pd.Series:
-        rng = series.max() - series.min()
-        return (series - series.min()) / rng if rng > 0 else pd.Series(0.0, index=series.index)
-
-    # Calculate normalized penalties relative to candidate models for this query
-    cost_norm = min_max_norm(cost)
-    latency_norm = min_max_norm(latency)
-    out_tokens_norm = min_max_norm(out_tokens)
-
-    # Utility score calculation
-    query_df['utility_score'] = (
-        weights['w_success'] * success
-        + weights['w_completion_reliability'] * reliability
-        - weights['w_cost'] * cost_norm
-        - weights['w_latency'] * latency_norm
-        - weights['w_output_tokens'] * out_tokens_norm
-    )
-
-    # Select key summary columns and sort by highest utility score
-    display_cols = [
-        'model', 'utility_score', 'Correct', 'Cost',
-        'Latency', 'Output_Tokens', 'Completion_Status'
-    ]
-
-    result = (
-        query_df[display_cols]
-        .sort_values(by='utility_score', ascending=False)
-        .reset_index(drop=True)
-    )
-
-    return result
-
-
-def compute_ranking_metrics(predicted_scores: dict, ground_truth_df: pd.DataFrame) -> dict:
-    """
-    Compare the router's predicted per-model scores against the
-    calculate_query_utility() ground-truth ranking for one query.
-
-    predicted_scores: {model_name: predicted_score}
-    ground_truth_df: output of calculate_query_utility() -- already sorted
-        best-to-worst by 'utility_score'.
-    """
-
-    print(predicted_scores)
-    gt = ground_truth_df.copy()
-    gt['predicted_score'] = gt['model'].map(predicted_scores)
-    if gt['predicted_score'].isna().any():
-        missing = gt.loc[gt['predicted_score'].isna(), 'model'].tolist()
-        raise ValueError(f"compute_ranking_metrics: no predicted score for model(s) {missing} -- "
-                          f"predicted_scores keys must match ground_truth_df['model'] exactly.")
-
-    n = len(gt)
-    gt_rank = gt['utility_score'].rank(ascending=False, method='first')
-    pred_rank = gt['predicted_score'].rank(ascending=False, method='first')
-
-    # Spearman rank correlation (no scipy dependency: Pearson correlation of ranks).
-    if n > 1 and gt_rank.std() > 0 and pred_rank.std() > 0:
-        spearman = float(np.corrcoef(gt_rank, pred_rank)[0, 1])
-    else:
-        spearman = float('nan')
-
-    top1_match = bool(gt.loc[gt_rank.idxmin(), 'model'] == gt.loc[pred_rank.idxmin(), 'model'])
-
-    # NDCG@3 -- ranks candidates by predicted score, scores against ground-truth utility.
-    k = min(3, n)
-    pred_order = gt.sort_values('predicted_score', ascending=False)
-    rel = pred_order['utility_score'].values[:k]
-    discounts = 1.0 / np.log2(np.arange(2, k + 2))
-    dcg = float(np.sum(rel * discounts))
-    ideal_rel = gt.sort_values('utility_score', ascending=False)['utility_score'].values[:k]
-    idcg = float(np.sum(ideal_rel * discounts))
-    ndcg_at_3 = dcg / idcg if idcg > 1e-12 else 0.0
-
-    mean_abs_rank_error = float(np.mean(np.abs(gt_rank.values - pred_rank.values)))
-
-    return {
-        'top1_match': top1_match,
-        'spearman_rank_corr': spearman,
-        'ndcg_at_3': ndcg_at_3,
-        'mean_abs_rank_error': mean_abs_rank_error,
-        'n_models': n,
-    }
-
-
-def plot_ground_truth_ranking(ground_truth_df: pd.DataFrame,
-                               output_dir: str, query_id, task_id=None, ranking_metrics=None):
-    """
-    Bar chart of the calculate_query_utility() ground-truth ranking alone --
-    candidate models ordered left-to-right best-to-worst by utility_score.
-    (Predicted scores are shown separately by make_plot(); this chart is
-    ground truth only, not a predicted-vs-ground-truth comparison.)
-
-    NOTE on scale: 'utility_score' here is calculate_query_utility()'s raw
-    success/cost/latency/output-tokens/reliability formula -- NOT the
-    softmax-smoothed edge_attr distribution the console's "Top-3 Ground
-    Truth LLMs" print uses. The raw formula is a signed sum (success +
-    reliability - weighted penalty terms), so negative utility_score values
-    here are expected for a model that failed the query/was penalized
-    heavily, and are not comparable in scale to the softmax probabilities
-    printed to console (which are always in [0, 1] and sum to 1 by
-    construction). Both are legitimate ground truths for different
-    purposes -- see infer_single_query's docstring.
-    """
-    import plotly.io as pio
-    import plotly.graph_objects as go
-
-    gt = ground_truth_df.sort_values('utility_score', ascending=False).reset_index(drop=True)
-    models = gt['model'].tolist()
-    gt_scores = gt['utility_score'].tolist()
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=models, y=gt_scores, name='Ground Truth (utility_score, raw)',
-                          marker_color='#ff7f0e',
-                          text=[f"{s:.3f}" for s in gt_scores], textposition='outside'))
-    fig.update_layout(
-        title=f"Ground-Truth Ranking | Query {query_id}"
-              f"{' | Task ' + str(task_id) if task_id is not None else ''}",
-        xaxis_title="LLM (ordered by ground-truth rank, best first)",
-        yaxis_title="Ground-truth utility_score (raw -- can be negative)",
-        template="plotly_white",
-        showlegend=False,
-    )
-
-    # Ranking metrics (Top-1 Match / Spearman / NDCG@3 / Mean Abs Rank Error),
-    # same numbers printed to console -- shown as an on-chart annotation so
-    # the saved HTML is self-contained.
-    metrics_text = _format_ranking_metrics_annotation(ranking_metrics)
-    if metrics_text:
-        fig.add_annotation(
-            xref="paper", yref="paper", x=1.0, y=1.0,
-            xanchor="right", yanchor="top",
-            text=metrics_text,
-            showarrow=False, align="left",
-            bordercolor="#888", borderwidth=1, borderpad=6,
-            bgcolor="rgba(255,255,255,0.85)",
-        )
-
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, f"ground_truth_ranking_query_{query_id}.html")
-    try:
-        fig.write_html(output_file)
-        print(f"Ground-truth ranking plot saved as: {output_file}")
-        pio.renderers.default = "browser"
-    except Exception:
-        pio.renderers.default = "colab"
-    fig.show()
-    return output_file
-
-
-# Maps each utility_weights key to the raw router_data column(s) whose
-# variance determines whether that weight can actually influence a ranking.
-# w_completion_reliability -> Completion_Status because reliability is
-# derived directly from it (constant status => constant reliability).
-_UTILITY_WEIGHT_SOURCE_COLUMNS = {
-    'w_success': ['Correct'],
-    'w_cost': ['Cost'],
-    'w_latency': ['Latency'],
-    'w_output_tokens': ['Output_Tokens'],
-    'w_completion_reliability': ['Completion_Status'],
-}
-
-
-def auto_drop_zero_variance_utility_weights(data_df: pd.DataFrame, weights: dict) -> dict:
-    """
-    Zero out (and warn about) any utility_weights entry whose source column
-    is constant across data_df.
-
-    A weight on a constant column contributes an identical additive term to
-    every (query, model) edge's utility -- it cancels out under the
-    per-query softmax and never changes which model ranks highest, so it's
-    dead weight that misleadingly looks "active" in config. This mirrors the
-    zero-variance auto-drop already applied to node metadata features, but
-    for the utility formula itself, and logs what happened instead of
-    silently doing nothing.
-
-    Non-destructive: returns a new dict, doesn't mutate the input weights.
-    """
-    resolved = dict(weights)
-    for weight_key, source_cols in _UTILITY_WEIGHT_SOURCE_COLUMNS.items():
-        if weight_key not in resolved or resolved[weight_key] == 0:
-            continue
-        for col in source_cols:
-            if col not in data_df.columns:
-                continue
-            if data_df[col].nunique(dropna=False) <= 1:
-                print(f"[utility_weights][WARN] '{col}' is constant "
-                      f"(value={data_df[col].iloc[0]!r}) across all rows -- "
-                      f"'{weight_key}'={resolved[weight_key]} contributes a "
-                      f"constant offset that cannot affect ranking. "
-                      f"Zeroing '{weight_key}' for this run; it will "
-                      f"automatically re-activate once '{col}' actually varies.")
-                resolved[weight_key] = 0.0
-    return resolved
-
-
-def resolve_utility_weights(config: dict) -> dict:
-    """
-    Resolve the active utility_weights dict from config.yaml.
-
-    Supports the new named-profile format:
-        utility_scenario: "cost_first"
-        utility_weight_profiles:
-          cost_first: {w_success: ..., w_cost: ..., ...}
-          balance: {...}
-          performance_first: {...}
-    and falls back to a flat `utility_weights:` dict (old format) or the
-    hardcoded default if neither is present, so existing configs and
-    direct-call sites don't break.
-    """
-    profiles = config.get('utility_weight_profiles')
-    if profiles:
-        scenario = config.get('utility_scenario')
-        if scenario is None:
-            raise ValueError(
-                "config has 'utility_weight_profiles' but no 'utility_scenario' "
-                "selecting which one is active. Set utility_scenario to one of: "
-                f"{list(profiles)}"
-            )
-        if scenario not in profiles:
-            raise ValueError(
-                f"utility_scenario '{scenario}' not found in utility_weight_profiles "
-                f"(available: {list(profiles)})"
-            )
-        return dict(profiles[scenario])
-
-    # Old flat format / direct fallback.
-    return config.get('utility_weights', {
-        'w_success': 1.0, 'w_cost': 0.3, 'w_latency': 0.3,
-        'w_output_tokens': 0.2, 'w_completion_reliability': 0.5,
-    })
-
-
-def _format_utility_weights_subtitle(utility_weights: dict) -> str:
-    """
-    Turn a utility_weights dict (w_success/w_cost/w_latency/w_output_tokens/
-    w_completion_reliability) into a human-readable "Success=1.0, Cost=0.3, ..."
-    string for use as a plot subtitle, so the weighting a chart was produced
-    under is visible on the chart itself instead of only in config.yaml.
-    """
-    if not utility_weights:
-        return ""
-    label_order = [
-        ("w_success", "Success"),
-        ("w_cost", "Cost"),
-        ("w_latency", "Latency"),
-        ("w_output_tokens", "Tokens"),
-        ("w_completion_reliability", "Reliability"),
-    ]
-    parts = [f"{label}={utility_weights[key]}" for key, label in label_order if key in utility_weights]
-    # Include any weight keys not in the known set rather than silently dropping them.
-    parts += [f"{k}={v}" for k, v in utility_weights.items() if k not in dict(label_order)]
-    return "Utility weights: " + ", ".join(parts)
-
-
-def _format_ranking_metrics_annotation(ranking_metrics: dict) -> str:
-    """
-    Turn a compute_ranking_metrics() dict into the same four-line summary
-    printed to console ("Top-1 Match", "Spearman Rank Corr", "NDCG@3",
-    "Mean Abs Rank Error"), for use as an on-chart annotation.
-    """
-    if not ranking_metrics:
-        return ""
-    return (
-        f"Top-1 Match: {ranking_metrics['top1_match']}<br>"
-        f"Spearman Rank Corr: {ranking_metrics['spearman_rank_corr']:.4f}<br>"
-        f"NDCG@3: {ranking_metrics['ndcg_at_3']:.4f}<br>"
-        f"Mean Abs Rank Error: {ranking_metrics['mean_abs_rank_error']:.4f}"
-    )
-
-
-def make_plot(scores, output_dir, scenario, query_id, task_id, utility_weights=None, ranking_metrics=None):
-    results_list = []
-    for llm, score in scores.items():
-        results_list.append({
-            "LLM": llm,
-            "Score": score,
-            "Scenario": scenario
-        })
-
-    df_scores = pd.DataFrame(results_list)
-    import plotly.io as pio
-    import plotly.express as px
-    # Compute min/max for y-axis with margin
-    y_min = df_scores["Score"].min()
-    y_max = df_scores["Score"].max()
-    margin = (y_max - y_min) * 0.05  # 5% margin
-
-    # Title reflects the utility_weights the ground truth for this run was
-    # computed under (w_success/w_cost/w_latency/w_output_tokens/
-    # w_completion_reliability from config.yaml), instead of a fixed,
-    # weight-agnostic string.
-    weights_subtitle = _format_utility_weights_subtitle(utility_weights)
-    title = f"LLM Scores for Query {query_id} | Task {task_id}"
-    if weights_subtitle:
-        title += f"<br><sup>{weights_subtitle}</sup>"
-
-    # Create interactive grouped bar chart
-    fig = px.bar(
-        df_scores,
-        x="LLM",
-        y="Score",
-        # color="Scenario",
-        barmode="group",
-        text=df_scores["Score"].apply(lambda x: f"{x:.3f}"),
-        title=title
-    )
-
-    # Update layout for better readability
-    fig.update_layout(
-        xaxis_title="LLM",
-        yaxis_title="Score",
-        xaxis_tickangle=-45,
-        yaxis=dict(showgrid=True, range=[y_min - margin, y_max + margin]),
-        # legend_title="Scenario",
-        template="plotly_white"
-    )
-
-    # Ranking metrics (Top-1 Match / Spearman / NDCG@3 / Mean Abs Rank Error),
-    # same numbers printed to console -- shown as an on-chart annotation so
-    # the saved HTML is self-contained.
-    metrics_text = _format_ranking_metrics_annotation(ranking_metrics)
-    if metrics_text:
-        fig.add_annotation(
-            xref="paper", yref="paper", x=1.0, y=1.0,
-            xanchor="right", yanchor="top",
-            text=metrics_text,
-            showarrow=False, align="left",
-            bordercolor="#888", borderwidth=1, borderpad=6,
-            bgcolor="rgba(255,255,255,0.85)",
-        )
-
-    # Save as HTML file
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, f"llm_scores_query_{query_id}.html")
-    try:
-        fig.write_html(output_file)
-        print(f"Graph saved as: {output_file}")
-        pio.renderers.default = "browser"
-
-    except:
-        pio.renderers.default = "colab"
-
-    fig.show()
-
-
-# File I/O functions
-def loadjson(filename: str) -> dict:
-    """
-    Load data from a JSON file.
-
-    Args:
-        filename: Path to the JSON file
-
-    Returns:
-        Dictionary containing the loaded JSON data
-    """
-    with open(filename, 'r', encoding='utf-8') as file:
-        data = json.load(file)
-    return data
-
-
-def savejson(data: dict, filename: str) -> None:
-    """
-    Save data to a JSON file.
-
-    Args:
-        data: Dictionary to save
-        filename: Path where the JSON file will be saved
-    """
-    with open(filename, 'w') as json_file:
-        json.dump(data, json_file, indent=4)
-
-
-def loadpkl(filename: str) -> any:
-    """
-    Load data from a pickle file.
-
-    Args:
-        filename: Path to the pickle file
-
-    Returns:
-        The unpickled object
-    """
-    with open(filename, 'rb') as file:
-        data = pickle.load(file)
-    return data
-
-
-def savepkl(data: any, filename: str) -> None:
-    """
-    Save data to a pickle file.
-
-    Args:
-        data: Object to save
-        filename: Path where the pickle file will be saved
-    """
-    with open(filename, 'wb') as pkl_file:
-        pickle.dump(data, pkl_file)
-
-
-class graph_router_prediction:
+class graph_router_prediction(DataIntegrityMixin, KFoldCVMixin):
     def __init__(self, router_data_path, llm_path, llm_embedding_path, config, wandb, query_id=0, task_id=None,
                  adaptive=False, inference=False, benchmark_path=None):
         self.config = config
@@ -605,9 +185,15 @@ class graph_router_prediction:
         )
         # in_edges = utility scalar (1) + Phase-4 edge feature vector
         self.edge_dim = 1 + self.encoders.edge_feature_dim
+        # Reasoning node feature width = number of domain macro-categories
+        # (== number of shared Reasoning prototype nodes). Fixed by the
+        # taxonomy in feature_builder.DOMAIN_MACRO_CATEGORIES, not fit from
+        # data, so this is stable across train/val/test/inference.
+        self.reasoning_dim = self.encoders.reasoning_node_dim
         print(f"[feature_builder] fit on {len(train_df)} train rows -- "
               f"node_metadata_dim={self.encoders.node_metadata_dim}, "
-              f"edge_feature_dim={self.encoders.edge_feature_dim} (+1 utility col = {self.edge_dim} total)")
+              f"edge_feature_dim={self.encoders.edge_feature_dim} (+1 utility col = {self.edge_dim} total), "
+              f"reasoning_dim={self.reasoning_dim} ({self.encoders.reasoning_categories})")
 
         # DIAGNOSTIC: if node_metadata_dim doesn't drop after mapping difficulty/
         # reasoning_depth to integers, this block tells you exactly why --
@@ -636,8 +222,6 @@ class graph_router_prediction:
                       f"the join match rate printed above.")
 
         if inference:
-            self.num_llms
-
             start = int(query_id) * self.num_llms
             rows = self.data_df.iloc[start:start + self.num_llms]
             print(f"\n================Task: {rows.iloc[0]['row_id']}================")
@@ -658,15 +242,48 @@ class graph_router_prediction:
             task_embedding = np.array(task_embedding)
 
             node_metadata = fb.build_node_metadata(rows.iloc[[0]], self.encoders)
-            if node_metadata.shape[1] > 0:
+            if not config.get('ablation_disable_node_metadata', False) and node_metadata.shape[1] > 0:
                 query_embedding = np.concatenate([query_embedding, node_metadata], axis=1)
 
             query_dim = query_embedding.shape[1]
 
+            # Reasoning prototype nodes (shared, one per domain
+            # macro-category) + which one this single query belongs to.
+            self.reasoning_features = fb.build_reasoning_node_features(self.encoders)
+            self.reasoning_node_id = fb.assign_reasoning_node_index(rows.iloc[[0]], self.encoders)
+
             self.model = EncoderDecoderNet(query_feature_dim=query_dim, llm_feature_dim=self.llm_dim,
-                                           hidden_features=self.config['embedding_dim'], in_edges=self.edge_dim).to(
+                                           hidden_features=self.config['embedding_dim'], in_edges=self.edge_dim,
+                                           reasoning_feature_dim=self.reasoning_dim,
+                                           edge_aware=self.config.get('ablation_edge_aware', True)).to(
                 device)
             self.form_data = form_data(device)
+
+            # Cache the exact tensors this inference call used. Purely
+            # additive (nothing downstream reads these) -- exists so
+            # external experiment scripts (e.g. inductive-generalization
+            # splice tests) can reuse the IDENTICAL query/task embedding
+            # this instance's trained model saw, instead of recomputing
+            # them and risking silent drift from this code path.
+            #
+            # BUGFIX: 'row_id' is a per-(query,model) row identifier -- each
+            # model's row for the same query has a DIFFERENT row_id. It is
+            # NOT a safe lookup key for "give me this query's row for a
+            # different model". The actual query-level identifier is
+            # 'query_id' (mirrors the group_col logic in
+            # _enforce_rectangular_query_blocks, which falls back to the raw
+            # 'query' text column if 'query_id' isn't present). Cache BOTH
+            # the group column name and this query's value under it, so
+            # callers look up the correct grouping key regardless of which
+            # column is actually in use.
+            group_col = "query_id" if "query_id" in self.data_df.columns else "query"
+            self.last_query_group_col = group_col
+            self.last_query_group_value = rows.iloc[0][group_col]
+            self.last_query_embedding = query_embedding
+            self.last_task_embedding = task_embedding
+            self.last_rows_df = rows
+            self.last_query_row_id = rows.iloc[0]['row_id']
+
             results = self.infer_single_query(query_embedding, task_embedding,
                                               query_row_id=rows.iloc[0]['row_id'], rows_df=rows)
 
@@ -706,68 +323,43 @@ class graph_router_prediction:
 
                 adaptive_updater.flush()
 
-
-
-
         elif config.get('kfold_cv', False):
-            # K-Fold CV mode: bypasses the single 90/10-style split entirely
-            # (query_dim/edge_dim still need self.prepare_data_for_GNN(),
-            # but self.split_data()'s single train/val/test masks are unused
-            # here -- run_kfold_cv builds its own per-fold masks).
-            self.prepare_data_for_GNN()
-            self.query_dim = self.query_embedding_list.shape[1]
-
-            # Same per-query softmax + one-hot label derivation split_data()
-            # does -- independent of any train/val/test split, so it's safe
-            # to compute here without calling split_data() itself.
-            SOFTMAX_TEMPERATURE = 1.0
-            utility_reshaped = self.utility_list.reshape(-1, self.num_llms) / SOFTMAX_TEMPERATURE
-            exp_scores = np.exp(utility_reshaped - np.max(utility_reshaped, axis=1, keepdims=True))
-            softmax_per_query = exp_scores / np.sum(exp_scores, axis=1, keepdims=True)
-            utility_softmaxed = softmax_per_query.reshape(-1)
-            utility_re = utility_softmaxed.reshape(-1, self.num_llms)
-            kfold_label = np.eye(self.num_llms)[np.argmax(utility_re, axis=1)].reshape(-1, 1)
-
-            # Router-level evaluation (Relative Utility Gap Closed vs Oracle/
-            # SBM/Random/Cost-Optimal baselines, Top-1/Top-K match, NDCG@3)
-            # needs the RAW (pre-softmax) utility per query-model edge
-            # attached to data_df, since that's what "which model was
-            # actually best for this query" has to be judged against --
-            # the softmaxed/one-hot label is a training target, not a
-            # utility scale. self.utility_list at this point IS that raw
-            # scale (fb.compute_utility output, before the softmax block
-            # above reassigns a local `utility_softmaxed`).
-            eval_df = self.data_df.copy()
-            eval_df['utility'] = self.utility_list
-
-            self.kfold_results = run_kfold_cv(
-                query_feature_dim=self.query_dim, llm_feature_dim=self.llm_dim,
-                hidden_features_size=self.config['embedding_dim'], in_edges_size=self.edge_dim,
-                config=self.config, device=device,
-                task_embedding_list=self.task_embedding_list,
-                query_embedding_list=self.query_embedding_list,
-                llm_description_embedding=self.llm_description_embedding,
-                edge_org_id=[num for num in range(self.num_query) for _ in range(self.num_llms)],
-                edge_des_id=list(range(self.num_llms)) * self.num_query,
-                utility_list=utility_softmaxed, label=kfold_label, combined_edge=self.edge_features,
-                num_llms=self.num_llms, num_query=self.num_query,
-                k=config.get('kfold_k', 5),
-                inner_val_ratio=config.get('kfold_inner_val_ratio', 0.1),
-                wandb=self.wandb, make_plots=config.get('kfold_make_plots', False),
-                data_df=eval_df, gold_col='utility',
-                cost_col=config.get('router_eval_cost_col', 'Cost'),
-                correctness_col=config.get('router_eval_correctness_col', 'Correct'),
-                latency_col=config.get('router_eval_latency_col', 'Latency'),
-            )
+            # K-Fold CV mode.
+            #
+            # LEAKAGE FIX (was: featurize-once-then-split):
+            # The old code called self.prepare_data_for_GNN() ONCE, which
+            # featurized the ENTIRE dataset using self.encoders -- an encoder
+            # instance fit in __init__ on a single global train split, before
+            # this branch even runs. run_kfold_cv() then ran its own KFold
+            # over those already-featurized rows. Every fold's "held-out"
+            # queries had therefore already influenced (via that earlier,
+            # unrelated global split, which generally overlaps with a given
+            # fold's holdout) the encoder categories / normalization stats
+            # used to featurize them -- exactly backwards from proper CV.
+            #
+            # Fix: split raw (unfeaturized) query rows into folds FIRST, then
+            # -- independently, per fold -- fit a fresh FeatureEncoders
+            # instance on ONLY that fold's inner-train rows and use it
+            # (transform-only) for that fold's inner-val and holdout rows.
+            # No encoder instance is ever shared across folds or fit on
+            # anything outside its own fold's inner-train split. This is
+            # implemented in KFoldCVMixin._run_kfold_cv_no_leakage(); it
+            # replaces the old prepare_data_for_GNN()+run_kfold_cv() call
+            # entirely, since run_kfold_cv()'s internal splitting operated
+            # on already-featurized tensors and can't be made leakage-safe
+            # without moving encoder fitting inside its loop.
+            self.kfold_results = self._run_kfold_cv_no_leakage()
         else:
-            from graph_nn import GNN_prediction
+            from model.gnn_trainer import GNN_prediction
             self.prepare_data_for_GNN()
             self.split_data()
             self.form_data = form_data(device)
             self.query_dim = self.query_embedding_list.shape[1]
             self.GNN_predict = GNN_prediction(query_feature_dim=self.query_dim, llm_feature_dim=self.llm_dim,
                                               hidden_features_size=self.config['embedding_dim'],
-                                              in_edges_size=self.edge_dim, wandb=self.wandb, config=self.config,
+                                              in_edges_size=self.edge_dim,
+                                              reasoning_feature_dim=self.reasoning_dim,
+                                              wandb=self.wandb, config=self.config,
                                               device=device)
             print("GNN training successfully initialized.")
             self.train_GNN()
@@ -781,117 +373,6 @@ class graph_router_prediction:
             torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-
-    def _compute_split_row_indices(self):
-        """
-        Row indices (into self.data_df, 0-indexed, task/query/llm-major order)
-        for train/validate/test. Extracted out of split_data() so it can run
-        BEFORE encoder fitting -- encoders must only see train rows.
-        Idempotent: safe to call more than once (e.g. once early for encoder
-        fitting, once again implicitly via split_data() for mask construction).
-        """
-        self.query_per_task = int(self.num_query / self.num_task)
-        split_ratio = self.config['split_ratio']
-
-        train_size = int(self.query_per_task * split_ratio[0])
-        val_size = int(self.query_per_task * split_ratio[1])
-        test_size = int(self.query_per_task * split_ratio[2])
-
-        train_idx, validate_idx, test_idx = [], [], []
-        for task_id in range(self.num_task):
-            start_idx = task_id * self.query_per_task * self.num_llms
-            train_idx.extend(range(start_idx, start_idx + train_size * self.num_llms))
-            validate_idx.extend(range(start_idx + train_size * self.num_llms,
-                                      start_idx + train_size * self.num_llms + val_size * self.num_llms))
-            test_idx.extend(range(start_idx + train_size * self.num_llms + val_size * self.num_llms,
-                                  start_idx + train_size * self.num_llms + val_size * self.num_llms + test_size * self.num_llms))
-
-        self.train_row_idx = train_idx
-        self.validate_row_idx = validate_idx
-        self.test_row_idx = test_idx
-        return train_idx, validate_idx, test_idx
-
-    def _enforce_rectangular_query_blocks(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Guarantee the invariant every downstream positional index relies on:
-        each query occupies exactly self.num_llms consecutive rows, one per
-        distinct model value found in the router data. Groups by `query_id`
-        (present in router_data.csv per Revised_Feature_Plan.md); falls back
-        to grouping by raw `query` text with a warning if query_id is missing.
-
-        The "complete set" of models is derived from the router dataset's own
-        `model` column (self-consistency check), NOT compared against
-        LLM_Descriptions.json's llm_names -- the two use unrelated naming
-        schemes and matching them is a separate concern from data integrity.
-        The one thing we do verify is that the router data's own model
-        vocabulary has exactly self.num_llms distinct values, since that's
-        the cardinality every downstream tensor shape assumes.
-
-        Any query_id whose row set doesn't cover that vocabulary exactly once
-        (missing run, duplicate run) is DROPPED WHOLESALE and reported --
-        keeping it would silently misalign edge_org_id/edge_des_id/
-        unique_index_list for every query after it, which is strictly worse
-        than losing that one query's data.
-        """
-        group_col = "query_id" if "query_id" in df.columns else "query"
-        if group_col == "query":
-            print("[data_integrity][WARN] no query_id column found -- grouping by raw "
-                  "query text instead. If two different queries have identical text this "
-                  "will incorrectly merge them.")
-
-        wanted_models = sorted(df["model"].unique().tolist())
-        if len(wanted_models) != self.num_llms:
-            raise ValueError(
-                f"[data_integrity] router_data's `model` column has {len(wanted_models)} distinct "
-                f"values {wanted_models}, but LLM_Descriptions.json declares {self.num_llms} LLMs "
-                f"({self.llm_names}). These counts must match -- check for typos/extra models in "
-                f"the data or a stale LLM_Descriptions.json."
-            )
-        wanted_models_set = set(wanted_models)
-        llm_order = {name: i for i, name in enumerate(wanted_models)}  # stable order, data-derived
-
-        # BUGFIX (name mismatch): `wanted_models` (raw router ids, e.g.
-        # 'openai/gpt-5') is what every row gets positionally sorted into,
-        # and self.llm_names (display names, e.g. 'GPT-5') is what the rest
-        # of the pipeline (scores dict, best_llm, etc.) is keyed by. Nothing
-        # upstream ever recorded which raw id corresponds to which display
-        # name -- the two lists just happen to share the same positional
-        # order once both are the index-i-th model. Persist that
-        # correspondence here, once, so downstream code (infer_single_query /
-        # compute_ranking_metrics) can translate router ids <-> display
-        # names instead of comparing them directly.
-        self.router_model_ids = wanted_models
-        self.router_id_to_display = dict(zip(self.router_model_ids, self.llm_names))
-
-        kept_blocks = []
-        n_dropped_queries = 0
-        dropped_ids = []
-        for key, group in df.groupby(group_col, sort=False):
-            models_here = group["model"].tolist()
-            if len(models_here) != self.num_llms or set(models_here) != wanted_models_set:
-                n_dropped_queries += 1
-                dropped_ids.append(key)
-                continue
-            kept_blocks.append(group.assign(_llm_sort=group["model"].map(llm_order)).sort_values("_llm_sort"))
-
-        if n_dropped_queries:
-            preview = dropped_ids[:10]
-            print(f"[data_integrity][WARN] dropped {n_dropped_queries} incomplete/duplicate "
-                  f"query group(s) out of {df[group_col].nunique()} -- these queries did not "
-                  f"have exactly one row per model in {wanted_models}. Example query_id(s): {preview}"
-                  f"{' ...' if n_dropped_queries > 10 else ''}")
-
-        if not kept_blocks:
-            raise ValueError(
-                "[data_integrity] 0 complete query blocks after filtering -- check the `model` "
-                "column values in router_data.csv for typos/inconsistent naming: " + str(wanted_models)
-            )
-
-        result = pd.concat(kept_blocks, axis=0, ignore_index=True).drop(columns=["_llm_sort"])
-        n_before, n_after = len(df), len(result)
-        print(f"[data_integrity] rectangular-block check: {n_before} -> {n_after} rows "
-              f"({n_before - n_after} dropped), {n_after // self.num_llms} complete queries retained.")
-        return result
 
     def split_data(self):
         train_idx, validate_idx, test_idx = self._compute_split_row_indices()
@@ -958,10 +439,26 @@ class graph_router_prediction:
         # here we build the "Concat" half by appending the metadata vector to the raw
         # text embedding, subset to one row per unique query exactly as the embeddings above.
         node_metadata = fb.build_node_metadata(self.data_df, self.encoders)[unique_index_list]
-        if node_metadata.shape[1] > 0:
+        # Question Metadata ablation: skip the concat entirely when disabled.
+        # query_feature_dim downstream (self.query_dim, line ~329) is
+        # inferred from self.query_embedding_list.shape[1] at runtime, so no
+        # other dimension needs updating -- this is a clean toggle. Must
+        # match whatever this checkpoint's training run used (see config.yaml
+        # comment on ablation_disable_node_metadata) or load_state_dict will
+        # fail on a shape mismatch at inference time.
+        if not self.config.get('ablation_disable_node_metadata', False) and node_metadata.shape[1] > 0:
             self.query_embedding_list = np.concatenate(
                 [self.query_embedding_list, node_metadata], axis=1
             )
+
+        # --- Reasoning node type: shared prototype nodes (one per domain
+        # macro-category, NOT one per query) plus each query's assignment
+        # to one of those prototypes. Domain macro-category is deliberately
+        # excluded from node_metadata above -- it lives on these Reasoning
+        # nodes instead, connected to Question nodes via edges built in
+        # form_data.formulation(). ---
+        self.reasoning_features = fb.build_reasoning_node_features(self.encoders)
+        self.reasoning_node_id = fb.assign_reasoning_node_index(self.data_df, self.encoders)[unique_index_list]
 
         # --- Phase 4: edge feature vector (per router_data row, i.e. per query-model edge) ---
         self.edge_features = fb.build_edge_features(self.data_df, self.encoders)
@@ -980,7 +477,9 @@ class graph_router_prediction:
                                                              edge_feature=self.utility_list, edge_mask=self.mask_train,
                                                              label=self.label, combined_edge=self.combined_edge,
                                                              train_mask=self.mask_train, valide_mask=self.mask_validate,
-                                                             test_mask=self.mask_test)
+                                                             test_mask=self.mask_test,
+                                                             reasoning_feature=self.reasoning_features,
+                                                             reasoning_node_id=self.reasoning_node_id)
         self.data_for_GNN_validate = self.form_data.formulation(task_id=self.task_embedding_list,
                                                                 query_feature=self.query_embedding_list,
                                                                 llm_feature=self.llm_description_embedding,
@@ -991,7 +490,9 @@ class graph_router_prediction:
                                                                 combined_edge=self.combined_edge,
                                                                 train_mask=self.mask_train,
                                                                 valide_mask=self.mask_validate,
-                                                                test_mask=self.mask_test)
+                                                                test_mask=self.mask_test,
+                                                                reasoning_feature=self.reasoning_features,
+                                                                reasoning_node_id=self.reasoning_node_id)
 
         self.data_for_test = self.form_data.formulation(task_id=self.task_embedding_list,
                                                         query_feature=self.query_embedding_list,
@@ -1001,12 +502,22 @@ class graph_router_prediction:
                                                         edge_feature=self.utility_list, edge_mask=self.mask_test,
                                                         label=self.label, combined_edge=self.combined_edge,
                                                         train_mask=self.mask_train, valide_mask=self.mask_validate,
-                                                        test_mask=self.mask_test)
+                                                        test_mask=self.mask_test,
+                                                        reasoning_feature=self.reasoning_features,
+                                                        reasoning_node_id=self.reasoning_node_id)
         self.GNN_predict.train_validate(data=self.data_for_GNN_train, data_validate=self.data_for_GNN_validate,
                                         data_for_test=self.data_for_test)
 
     def test_GNN(self):
-        predicted_result = self.GNN_predict.test(data=self.data_for_test, model_path=self.config['model_path'])
+        # Consistent with infer_single_query/train_validate -- resolve the
+        # ablation-arm-specific path rather than the raw config value, even
+        # though GNN_prediction.test()'s model_path arg is currently unused
+        # internally (it scores self.model already in memory). Keeping it
+        # accurate here avoids a misleading value if that changes later.
+        predicted_result = self.GNN_predict.test(
+            data=self.data_for_test, model_path=resolve_checkpoint_dir(self.config)
+        )
+        return predicted_result
 
     def infer_single_query(self, query_embedding, task_embedding=None, query_row_id=None, rows_df=None):
         """
@@ -1034,10 +545,89 @@ class graph_router_prediction:
         # as a DIRECTORY (it saves to {model_path}/best_model.pth), not a file
         # path -- config['model_path'] must be a directory now (e.g.
         # "checkpoints/"), not "checkpoints/best_model.pth" like before.
-        checkpoint_path = os.path.join(self.config['model_path'], "best_model.pth")
-        self.model.load_state_dict(
-            torch.load(checkpoint_path, map_location=device)
+        # Ablation-aware resolution: resolves to the SAME path training used
+        # for these exact ablation flags (see resolve_checkpoint_dir() in
+        # graph_layers.py) -- unchanged from plain config['model_path'] when
+        # both ablation flags are at their defaults.
+        checkpoint_dir = resolve_checkpoint_dir(self.config)
+        checkpoint_path = os.path.join(checkpoint_dir, "best_model.pth")
+        ablation_desc = (
+            f"ablation_disable_node_metadata="
+            f"{self.config.get('ablation_disable_node_metadata', False)}, "
+            f"ablation_edge_aware={self.config.get('ablation_edge_aware', True)}"
         )
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"No checkpoint found at '{checkpoint_path}' for the currently "
+                f"active ablation settings ({ablation_desc}). Each ablation arm "
+                f"needs its own trained checkpoint -- run training with these "
+                f"exact config values first (it will save here automatically), "
+                f"or reset the ablation flags to their defaults to use the "
+                f"checkpoint at "
+                f"'{os.path.join(self.config['model_path'], 'best_model.pth')}'."
+            )
+        try:
+            loaded_state = torch.load(checkpoint_path, map_location=device)
+        except Exception as e:
+            raise RuntimeError(f"Failed to read checkpoint file at '{checkpoint_path}': {e}") from e
+
+        # Pre-flight ablation compatibility check: compares the checkpoint's
+        # ACTUAL saved parameter shapes/keys against what the currently
+        # active config implies, and raises a specific, actionable
+        # diagnostic (naming the exact dims and which flag is inconsistent)
+        # instead of surfacing PyTorch's generic
+        # "size mismatch...copying a param with shape [...]" from
+        # load_state_dict, which gives no indication of *why*.
+        current_query_dim = np.array(query_embedding).reshape(1, -1).shape[1]
+        ckpt_query_w = loaded_state.get('model_align.query_transform.0.weight')
+        if ckpt_query_w is not None and ckpt_query_w.shape[1] != current_query_dim:
+            ckpt_had_metadata = ckpt_query_w.shape[1] > current_query_dim
+            raise RuntimeError(
+                f"Checkpoint/config mismatch at '{checkpoint_path}':\n"
+                f"  checkpoint's query_transform expects input dim "
+                f"{ckpt_query_w.shape[1]}, but the current config builds a "
+                f"query embedding of dim {current_query_dim}.\n"
+                f"  This checkpoint was trained with node_metadata "
+                f"{'INCLUDED' if ckpt_had_metadata else 'EXCLUDED'} "
+                f"(ablation_disable_node_metadata="
+                f"{not ckpt_had_metadata}), but the active config has "
+                f"ablation_disable_node_metadata="
+                f"{self.config.get('ablation_disable_node_metadata', False)}.\n"
+                f"Fix: either set ablation_disable_node_metadata="
+                f"{not ckpt_had_metadata} to match this checkpoint, or train "
+                f"a fresh checkpoint for the current ablation setting -- it "
+                f"will save to this same path via resolve_checkpoint_dir()."
+            )
+
+        ckpt_edge_aware = 'edge_mlp.weight' in loaded_state
+        config_edge_aware = self.config.get('ablation_edge_aware', True)
+        if ckpt_edge_aware != config_edge_aware:
+            raise RuntimeError(
+                f"Checkpoint/config mismatch at '{checkpoint_path}':\n"
+                f"  checkpoint was trained with ablation_edge_aware="
+                f"{ckpt_edge_aware}, but the active config has "
+                f"ablation_edge_aware={config_edge_aware}.\n"
+                f"Fix: either set ablation_edge_aware={ckpt_edge_aware} to "
+                f"match this checkpoint, or train a fresh checkpoint for the "
+                f"current ablation setting -- it will save to this same path "
+                f"via resolve_checkpoint_dir()."
+            )
+
+        try:
+            self.model.load_state_dict(loaded_state)
+        except RuntimeError as e:
+            # Should be rare now that the two checks above catch the common
+            # ablation-flag-mismatch cases explicitly -- if this still fires,
+            # it's something other than the flags covered above (e.g. a
+            # genuinely stale/foreign checkpoint file at this path).
+            raise RuntimeError(
+                f"Checkpoint at '{checkpoint_path}' does not match the model "
+                f"architecture implied by the current ablation settings "
+                f"({ablation_desc}), for a reason other than the "
+                f"node_metadata/edge_aware dims checked above -- inspect "
+                f"the checkpoint's other layer shapes directly.\n"
+                f"Original error: {e}"
+            ) from e
         self.model.eval()
 
         # If only one task in your setup
@@ -1092,7 +682,9 @@ class graph_router_prediction:
             combined_edge=combined_edge,
             train_mask=train_mask,
             valide_mask=validate_mask,
-            test_mask=test_mask
+            test_mask=test_mask,
+            reasoning_feature=self.reasoning_features,
+            reasoning_node_id=self.reasoning_node_id
         )
 
         # During inference, allow full visibility
@@ -1104,7 +696,9 @@ class graph_router_prediction:
                 task_id=data.task_id,
                 query_features=data.query_features,
                 llm_features=data.llm_features,
+                reasoning_features=data.reasoning_features,
                 edge_index=data.edge_index,
+                reasoning_edge_index=data.reasoning_edge_index,
                 edge_mask=edge_mask.bool(),
                 edge_can_see=edge_can_see,
                 edge_weight=data.combined_edge
@@ -1163,13 +757,32 @@ class graph_router_prediction:
             'gt_scores': gt_scores
         }
 
+        # --- Explainability: lightweight, rule-based reasons for the pick ---
+        # Uses the exact utility_weights already driving training/ranking
+        # (router_utility.py) plus, when available, the same rows_df raw
+        # Correct/Cost/Latency/Completion_Status/Output_Tokens columns
+        # already used for ranking_metrics below. Falls back to a
+        # predicted-score-margin-only explanation when rows_df isn't
+        # available (true blind inference on an unseen query has no raw
+        # outcome data to compare against).
+        explanation = explain_selection(
+            selected_model=result['best_llm'],
+            scores=scores,
+            weights=self.utility_weights,
+            rows_df=rows_df,
+            model_col='model',
+            id_to_display=getattr(self, 'router_id_to_display', None),
+        )
+        result['explanation'] = explanation['text']
+        result['explanation_signals'] = explanation['signals']
+        print("\n" + explanation['text'])
+
         # --- Metrics between predicted ranking and ground-truth ranking ---
         # Uses calculate_query_utility() (raw Correct/Cost/Latency/Output_Tokens/
         # Completion_Status columns, NOT the softmax-smoothed edge_attr used
         # above) as the ground truth, since that's the actual utility scale
         # the router is meant to be judged against.
         if query_row_id is not None and rows_df is not None:
-            # try:
             rows_with_qid = rows_df.assign(query_id=query_row_id)
             ground_truth_ranking = calculate_query_utility(
                 query_id=query_row_id, df=rows_with_qid,
@@ -1201,34 +814,5 @@ class graph_router_prediction:
             print(f"Mean Abs Rank Error  : {ranking_metrics['mean_abs_rank_error']:.4f}")
             result['ranking_metrics'] = ranking_metrics
             result['ground_truth_ranking'] = ground_truth_ranking
-            # except (KeyError, ValueError) as e:
-            #     print(f"[ranking_metrics][WARN] skipped -- {e}")
 
         return result
-
-
-# if __name__ == "__main__":
-#     import wandb
-#
-#     with open("configs/config.yaml", 'r', encoding='utf-8') as file:
-#         config = yaml.safe_load(file)
-#     wandb_key = config['wandb_key']
-#     wandb.login(key=wandb_key)
-#     wandb.init(project="graph_router")
-#
-#     data_dir = config['data_dir']
-#     router_data_path = os.path.join(data_dir, 'router_data.csv')
-#     if config['feedback']:
-#         router_data_path = os.path.join(data_dir, 'feedback/router_data.csv')
-#         if not os.path.exists(router_data_path):
-#             print("[INFO] No feedback found")
-#             router_data_path = os.path.join(data_dir, 'router_data.csv')
-#
-#     graph_router_prediction(
-#
-#         router_data_path=router_data_path,
-#         llm_path=os.path.join(data_dir, 'LLM_Descriptions.json'),
-#         llm_embedding_path=os.path.join(data_dir, "llm_description_embedding.pkl"),
-#         config=config,
-#         wandb=wandb
-#     )

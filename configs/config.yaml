@@ -7,9 +7,13 @@ query_response_length: 512
 # Config parameters for graph_router training:
 seed: 1881
 wandb_key: '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'
-model_path: 'checkpoints/final/'
+model_path: 'checkpoints/revised_MLP+semantic_embedd/'
+
+ablation_results_csv: 'checkpoints/revised_MLP+semantic_embedd/ablation_results.csv'
 feedback: False
-semantic: False
+semantic: True
+ablation_disable_node_metadata: True
+ablation_edge_aware: True
 
 train_epoch: 100
 kfold_cv: True
@@ -97,3 +101,29 @@ utility_weight_profiles:
     w_latency: 0.4
     w_output_tokens: 0.3
     w_completion_reliability: 0.1
+
+# --- Ablation study flags ---
+# Both flags below change a trained model's parameter shapes (see notes on
+# each), so a checkpoint trained with one setting CANNOT be loaded under a
+# different setting -- give each ablation arm its own model_path, e.g.:
+#   checkpoints/ablation_full/
+#   checkpoints/ablation_no_metadata/
+#   checkpoints/ablation_no_edge_aware/
+
+# Question Metadata ablation: when true, skips concatenating the structured
+# node_metadata vector (difficulty/reasoning_type/domain/etc, built in
+# feature_builder.build_node_metadata) onto the raw text query embedding,
+# in both prepare_data_for_GNN() (training) and the inference-mode query
+# embedding construction. Both FeatureAlign's query_transform input width
+# and GNN_prediction's query_feature_dim are inferred at runtime from the
+# actual embedding array shape, so this is a clean toggle -- no other
+# config value needs to change.
+
+# Edge-aware Message Passing ablation: when false, EncoderDecoderNet's two
+# GeneralConv layers are constructed WITHOUT in_edge_channels, and
+# edge_attr (the Phase-4 edge feature vector: Correct/Cost/Latency/
+# Output_Tokens/Completion_Status/...) is never built or passed into them
+# during forward() -- message passing then uses only node features and
+# graph structure, with zero visibility into per-edge outcome data at the
+# conv layers. The final edge_predictor scoring head is identical in both
+# arms; only the encoder path differs.
