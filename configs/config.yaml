@@ -12,7 +12,7 @@ model_path: 'checkpoints/revised_MLP+semantic_embedd/'
 ablation_results_csv: 'checkpoints/revised_MLP+semantic_embedd/ablation_results.csv'
 feedback: False
 semantic: True
-ablation_disable_node_metadata: True
+ablation_disable_node_metadata: False
 ablation_edge_aware: True
 
 train_epoch: 100
